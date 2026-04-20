@@ -1,0 +1,171 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/devsecops-app
+
+jobs:
+
+  # ── 1. SECRET SCANNING ────────────────────────────────────────
+  secret-scan:
+    name: Secret Scanning (Trufflehog)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trufflehog scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  # ── 2. SAST ───────────────────────────────────────────────────
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/owasp-top-ten
+            p/secrets
+
+  # ── 3. SCA — dipendenze ───────────────────────────────────────
+  sca:
+    name: SCA (Trivy filesystem)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  # ── 4. BUILD & PUSH IMAGE ─────────────────────────────────────
+  build-image:
+    name: Build, Scan & Push Image
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+    permissions:
+      packages: write
+      contents: read
+      security-events: write
+    outputs:
+      short-sha: ${{ steps.sha.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "sha=sha-$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (local, pre-scan)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.sha }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload image scan to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.sha.outputs.sha }}
+          path: sbom.cdx.json
+
+      - name: Push image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  # ── 5. UPDATE MANIFEST ────────────────────────────────────────
+  update-manifest:
+    name: Update K8s Manifest
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout manifests repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/devsecops-manifests
+          token: ${{ secrets.MANIFEST_REPO_TOKEN }}
+          path: manifests
+
+      - name: Update image tag
+        run: |
+          TAG="${{ needs.build-image.outputs.short-sha }}"
+          sed -i "s|image: ghcr.io/.*/devsecops-app:.*|image: ${{ env.IMAGE_NAME }}:${TAG}|g" \
+            manifests/deployment.yaml
+
+      - name: Commit & push
+        run: |
+          cd manifests
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment.yaml
+          git commit -m "ci: update image to ${{ needs.build-image.outputs.short-sha }}"
+          git push
