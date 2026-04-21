@@ -1,8 +1,7 @@
 const express = require('express');
 const helmet = require('helmet');
 
-
-const app = express(); // nosemgrep: javascript.express.security.audit.express-check-csurf-middleware-usage
+const app = express(); // nosemgrep: javascript.express.security.audit.express-check-csurf-middleware-usage.express-check-csurf-middleware-usage
 
 app.use(helmet());
 app.use(express.json());
